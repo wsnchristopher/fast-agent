@@ -9,7 +9,9 @@ import pytest
 from openai.types.responses import (
     Response,
     ResponseCreatedEvent,
+    ResponseFunctionToolCall,
     ResponseOutputMessage,
+    ResponseOutputRefusal,
     ResponseOutputText,
     ResponseTextDeltaEvent,
 )
@@ -118,6 +120,7 @@ class _DelayedResponsesSseStream:
 
 class _SimulatedSseMixin:
     sse_stream: _DelayedResponsesSseStream
+    sse_calls: int = 0
 
     def _responses_client(self) -> AsyncOpenAI:
         return cast("AsyncOpenAI", _ClientContext())
@@ -151,6 +154,7 @@ class _SimulatedSseMixin:
         timeout_seconds: float | None = None,
     ) -> AsyncIterator[_DelayedResponsesSseStream]:
         del client, arguments, timeout_seconds
+        self.sse_calls += 1
         yield self.sse_stream
 
 
@@ -209,10 +213,22 @@ async def test_sse_delta_reaches_listener_before_response_completes(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness_type", [_ResponsesSseHarness, _CodexResponsesSseHarness])
+@pytest.mark.parametrize("refusal", [False, True])
 async def test_safety_buffering_notice_reaches_listener_before_response_completes(
     harness_type: type[_ResponsesSseHarness] | type[_CodexResponsesSseHarness],
+    refusal: bool,
 ) -> None:
     harness = harness_type(safety_buffering=True)
+    if refusal:
+        harness.sse_stream.completed_message.content = [
+            ResponseOutputRefusal(type="refusal", refusal="I cannot help with that.")
+        ]
+        harness.sse_stream.final_response.output = [
+            harness.sse_stream.completed_message,
+            ResponseFunctionToolCall(
+                type="function_call", call_id="call_1", name="unused", arguments="{}"
+            ),
+        ]
     chunk_received = asyncio.Event()
     chunks: list[Any] = []
 
@@ -239,9 +255,13 @@ async def test_safety_buffering_notice_reaches_listener_before_response_complete
 
     assert chunks
     assert chunks[0].is_reasoning
-    assert "stopped the turn" in chunks[0].text
+    assert "Waiting for the original stream" in chunks[0].text
+    assert not completion.done()
+    assert harness.sse_calls == 1
 
+    harness.sse_stream.release_terminal.set()
     response = await asyncio.wait_for(completion, timeout=1.0)
-    assert response.stop_reason == LlmStopReason.SAFETY
-    assert "gpt-test-fast" in (response.last_text() or "")
-    assert not harness.sse_stream.release_terminal.is_set()
+    assert response.stop_reason == (LlmStopReason.SAFETY if refusal else LlmStopReason.END_TURN)
+    assert response.last_text() == ("I cannot help with that." if refusal else "hello world")
+    assert not response.tool_calls
+    assert harness.sse_calls == 1

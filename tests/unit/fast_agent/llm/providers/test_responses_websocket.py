@@ -19,9 +19,7 @@ from websockets.frames import Close
 from fast_agent.constants import (
     FAST_AGENT_ERROR_CHANNEL,
     FAST_AGENT_RETRY,
-    FAST_AGENT_SAFETY_DETAILS,
 )
-from fast_agent.core.exceptions import ProviderSafetyBufferingError
 from fast_agent.llm.provider.openai.codex_responses import (
     CODEX_RESPONSES_LITE_HEADER,
     CODEX_ROUTING_HINT_HEADER,
@@ -1479,7 +1477,7 @@ class _TimeoutLifecycleHarness(_ConnectionLifecycleHarness):
 
 
 class _SafetyBufferingLifecycleHarness(_ConnectionLifecycleHarness):
-    def __init__(self) -> None:
+    def __init__(self, *, refusal: bool = False) -> None:
         super().__init__()
         websocket = _FakeWebSocket(
             messages=[
@@ -1496,7 +1494,39 @@ class _SafetyBufferingLifecycleHarness(_ConnectionLifecycleHarness):
                             },
                         }
                     ),
-                )
+                ),
+                SimpleNamespace(
+                    type=WSMsgType.TEXT,
+                    data=json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_1",
+                                "status": "completed",
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "id": "msg_1",
+                                        "role": "assistant",
+                                        "status": "completed",
+                                        "content": [
+                                            {
+                                                "type": "refusal",
+                                                "refusal": "I cannot help with that.",
+                                            }
+                                            if refusal
+                                            else {
+                                                "type": "output_text",
+                                                "text": "hello world",
+                                                "annotations": [],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ),
             ]
         )
         connection = ManagedWebSocketConnection(session=_FakeSession(), websocket=websocket)
@@ -2364,50 +2394,35 @@ async def test_websocket_streaming_timeout_releases_reusable_connection() -> Non
 
 
 @pytest.mark.asyncio
-async def test_websocket_safety_buffering_stops_without_reconnect_or_wrapping() -> None:
-    harness = _SafetyBufferingLifecycleHarness()
+@pytest.mark.parametrize("refusal", [False, True])
+async def test_websocket_safety_buffering_continues_without_reconnect(refusal: bool) -> None:
+    harness = _SafetyBufferingLifecycleHarness(refusal=refusal)
     params = RequestParams(model="gpt-5.3-codex")
 
-    with pytest.raises(ProviderSafetyBufferingError) as exc_info:
-        await harness._responses_completion_ws(
-            input_items=_ws_input_items("hello"),
-            request_params=params,
-            tools=None,
-            model_name="gpt-5.3-codex",
-        )
-
-    assert exc_info.value.retry_model == "gpt-5.3-codex-spark"
-    assert harness._sequence_manager.acquire_calls == 1
-    assert len(harness.websocket.sent_payloads) == 1
-    assert harness._sequence_manager.release_keep_values == [False]
-
-
-@pytest.mark.asyncio
-async def test_safety_buffering_during_empty_response_retry_is_terminal() -> None:
-    harness = _TransportHarness(name="transport-harness", transport="sse")
-    harness.sse_errors = [None, ProviderSafetyBufferingError("gpt-test", "gpt-test-fast")]
-    harness.sse_texts = [None]
-
-    response = await harness._responses_completion(
+    chunks: list[Any] = []
+    harness.add_stream_listener(chunks.append)
+    response, _, _ = await harness._responses_completion_ws(
         input_items=_ws_input_items("hello"),
-        request_params=RequestParams(model="gpt-test"),
+        request_params=params,
+        tools=None,
+        model_name="gpt-5.3-codex",
     )
 
-    assert response.stop_reason == LlmStopReason.SAFETY
-    assert "gpt-test-fast" in (response.last_text() or "")
-    assert response.channels is not None
-    [details_block] = response.channels[FAST_AGENT_SAFETY_DETAILS]
-    assert isinstance(details_block, TextContent)
-    assert json.loads(details_block.text) == {
-        "provider": "codexresponses",
-        "category": "safety_buffering",
-        "model": "gpt-test",
-        "reasons": None,
-        "use_cases": None,
-        "retry_model": "gpt-test-fast",
-    }
-    assert harness.sse_calls == 2
-    assert harness.ws_calls == 0
+    assert response.status == "completed"
+    [content] = harness._responses_content_blocks(response)
+    assert isinstance(content, TextContent)
+    assert content.text == ("I cannot help with that." if refusal else "hello world")
+    assert harness._map_response_stop_reason(response) == (
+        LlmStopReason.SAFETY if refusal else LlmStopReason.END_TURN
+    )
+    assert chunks[0].is_reasoning
+    assert "Waiting for the original stream" in chunks[0].text
+    warning_data = harness._capturing_logger.warning_data[0]
+    assert warning_data is not None
+    assert warning_data["reasons"] == ["policy-check"]
+    assert harness._sequence_manager.acquire_calls == 1
+    assert len(harness.websocket.sent_payloads) == 1
+    assert harness._sequence_manager.release_keep_values == [True]
 
 
 @pytest.mark.asyncio
